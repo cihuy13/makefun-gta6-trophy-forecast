@@ -23,6 +23,12 @@ Model: counts + dilution + saturating growth.
     with sqrt(horizon in days), a small-count term (rare trophies are
     more volatile), and an extra term when the page never moved at
     all (a refresh is then overdue and the rates can jump).
+  * The median is blended 50/50 in logit space with a last-24h
+    velocity trend (the house curve baseline's fit: a least-squares
+    line of logit(rate) against log-time over the last 24 hours of
+    reads), so recent movement steers the forecast while the counts
+    model anchors it; the trend fit's residuals join the spread's
+    residual pool.
 
 Only the Python standard library is used. No network, no randomness:
 two runs on the same case produce byte-identical output.
@@ -201,12 +207,46 @@ def fit_series(xs, ys, x_target):
     return y_t, pick["predict"]
 
 
-def forecast_trophy(trophy, reads, players_fit, x_target, horizon_days, levels):
+def fit_velocity_trend(reads, x_target, hours_checkpoint):
+    """House curve baseline's trend: least-squares line of logit(rate)
+    against log-time over the last 24 hours of reads.
+
+    Returns (median_percent, sse, n) at x_target, or None when fewer
+    than 3 usable reads exist in the window.
+    """
+    pts = []
+    for rd in reads:
+        rate = rd["rate"]
+        if rate is None or rate <= 0 or rate >= 100:
+            continue
+        if rd["hours"] < hours_checkpoint - 24.0:
+            continue
+        pts.append((rd["x"], logit(rate / 100.0)))
+    if len(pts) < 3:
+        return None
+    n = float(len(pts))
+    mx = sum(p[0] for p in pts) / n
+    my = sum(p[1] for p in pts) / n
+    sxx = sum((p[0] - mx) ** 2 for p in pts)
+    if sxx <= 0:
+        pred = my
+        sse = sum((p[1] - my) ** 2 for p in pts)
+        return (100.0 * sigmoid(pred), sse, len(pts))
+    b = sum((p[0] - mx) * (p[1] - my) for p in pts) / sxx
+    a = my - b * mx
+    pred = a + b * x_target
+    sse = sum((p[1] - (a + b * p[0])) ** 2 for p in pts)
+    pred = clamp(pred, logit(0.0001), logit(0.9999))
+    return (100.0 * sigmoid(pred), sse, len(pts))
+
+
+def forecast_trophy(trophy, reads, players_fit, x_target, horizon_days,
+                    hours_checkpoint, levels):
     """Forecast one trophy's five quantiles.
 
-    reads: list of {"x", "players", "rate"} oldest first, rate None
-    where the read lacked the trophy. players_fit is (p_target,
-    p_predict) for the shared players series.
+    reads: list of {"x", "hours", "players", "rate"} oldest first,
+    rate None where the read lacked the trophy. players_fit is
+    (p_target, p_predict) for the shared players series.
     """
     p_target, p_predict = players_fit
     tier = trophy.get("tier", "bronze")
@@ -252,6 +292,15 @@ def forecast_trophy(trophy, reads, players_fit, x_target, horizon_days, levels):
     median = 100.0 * e_target / p_target
     median = clamp(median, 0.01, 99.99)
 
+    # Last-24h velocity trend, blended 50/50 in logit space with the
+    # counts-model median (the house curve baseline's fit).
+    trend = fit_velocity_trend(reads, x_target, hours_checkpoint)
+    if trend is not None:
+        t_median, t_sse, t_n = trend
+        median = 100.0 * sigmoid(
+            0.5 * logit(median / 100.0) + 0.5 * logit(t_median / 100.0))
+        median = clamp(median, 0.01, 99.99)
+
     # Residual scatter of the rate model, in logit space: compare each
     # read's observed rate with the model rate at that read's time.
     sq = []
@@ -263,7 +312,12 @@ def forecast_trophy(trophy, reads, players_fit, x_target, horizon_days, levels):
             continue
         m_rate = clamp(100.0 * e_predict(x) / p_pred, 0.01, 99.99)
         sq.append((logit(obs / 100.0) - logit(m_rate / 100.0)) ** 2)
-    s_fit = math.sqrt(sum(sq) / len(sq)) if len(sq) >= 2 else 0.0
+    sq_sum = sum(sq)
+    sq_n = len(sq)
+    if trend is not None:
+        sq_sum += t_sse
+        sq_n += t_n
+    s_fit = math.sqrt(sq_sum / sq_n) if sq_n >= 2 else 0.0
 
     # Spread: fit scatter + horizon random walk + small-count term
     # (+ a stale-page term when nothing ever moved). The stale-page
@@ -302,6 +356,7 @@ def forecast_case(case):
     horizon_days = case.get("horizon_minutes", 0) / 1440.0
     levels = case.get("levels", [0.05, 0.25, 0.5, 0.75, 0.95])
     x_target = log_time(parse_time(case["target"]))
+    hours_checkpoint = (parse_time(case["at"]) - EPOCH).total_seconds() / 3600.0
 
     # Shared players series (all reads with a player count).
     px, pv = [], []
@@ -326,11 +381,12 @@ def forecast_case(case):
             rate = rates[j] if j < len(rates) else None
             reads.append({
                 "x": log_time(parse_time(rd["at"])),
+                "hours": (parse_time(rd["at"]) - EPOCH).total_seconds() / 3600.0,
                 "players": rd.get("players_tracked"),
                 "rate": rate,
             })
         q = forecast_trophy(trophy, reads, players_fit, x_target,
-                            horizon_days, levels)
+                            horizon_days, hours_checkpoint, levels)
         rows.append({"id": trophy["id"], "q": q})
     return rows
 
